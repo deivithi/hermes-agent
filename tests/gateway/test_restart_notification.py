@@ -367,6 +367,19 @@ async def test_shutdown_home_channel_broadcast_carries_interim_marker():
 
 
 @pytest.mark.asyncio
+async def test_idle_shutdown_does_not_claim_a_task_was_interrupted():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-42", name="Ops Home",
+    )
+    adapter.send = AsyncMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="active-42", chat_type="group", thread_id="topic-7")

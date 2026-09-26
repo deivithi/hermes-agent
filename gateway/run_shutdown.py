@@ -1029,7 +1029,8 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
-        for session_key in self._snapshot_running_agents():
+        running_sessions = self._snapshot_running_agents()
+        for session_key in running_sessions:
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
@@ -1078,6 +1079,9 @@ class GatewayShutdownMixin:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+            return
+        if not running_sessions:
+            logger.info("Skipping home-channel interruption notice: no active chat task")
             return
         # A quiet drain (routine fleet auto-update) suppresses ONLY the home-channel broadcast; per-session
         # pings above stay. Current-epoch marker only; a failing check fails toward the louder behaviour.
