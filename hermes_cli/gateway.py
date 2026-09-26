@@ -1149,7 +1149,11 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
     ).strip().format(respawn_cwd_literal=json.dumps(respawn_cwd), respawn_env_literal=json.dumps(respawn_env_overlay),
                      watcher_timeout_literal=json.dumps(GATEWAY_RESTART_WATCHER_TIMEOUT_S))
 
-    watcher_argv = [sys.executable, "-c", watcher, str(old_pid), *run_argv]
+    # PM's base interpreter has no application dependencies until bootstrap
+    # selects a generation. The watcher imports gateway.status before it can
+    # respawn anything, so it needs the same installation-bound bootstrap.
+    from hermes_cli._launchers import runtime_command
+    watcher_argv = runtime_command(PROJECT_ROOT, [str(old_pid), *run_argv], code=watcher)
     devnull = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     # Host respawn must not inherit a named launcher's dotenv. The watcher copies os.environ
     # into the gateway child, so the scrub has to be the watcher's own environ.
@@ -5658,4 +5662,3 @@ def _pm_runtime_venv_dir(project_root: Path | None = None) -> Path | None:
 
     venv = selected_venv(root)  # a malformed committed selection raises: fail closed
     return venv if venv.is_dir() else None
-

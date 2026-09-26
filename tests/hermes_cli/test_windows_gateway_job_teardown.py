@@ -20,6 +20,14 @@ Two fixes under test:
    updater's Job Object teardown.
 """
 
+import ast
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import hermes_cli.gateway as gateway
 
 # ---------------------------------------------------------------------------
@@ -44,8 +52,55 @@ def _captured_watcher_source(monkeypatch) -> str:
         999999, ["python", "-m", "hermes_cli.main", "gateway", "run"]
     )
     argv = captured["argv"]
-    assert argv[1] == "-c"
-    return argv[2]
+    bootstrap = ast.parse(argv[argv.index("-c") + 1])
+    return ast.literal_eval(bootstrap.body[-1].value.args[0])
+
+
+def test_restart_watcher_bootstraps_dependencies_in_fresh_process(tmp_path, monkeypatch):
+    """Run the captured real watcher in a fresh interpreter and isolated home.
+
+    A bare PM Python -c watcher dies importing ruamel via gateway.status;
+    the parent process having bootstrapped does not provision its child.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    marker = tmp_path / "respawned"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Give the sandbox its own committed selection without installing packages
+    # or leasing/mutating the real home's generation. Reuse this test runtime's
+    # installed dependencies through a .pth in the disposable generation.
+    import ruamel.yaml
+    from pm.environments import install_state_dir, site_packages
+    state = install_state_dir(gateway.PROJECT_ROOT)
+    environment = state / "environments" / "fixture" / "venv"
+    packages = site_packages(environment)
+    packages.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("include-system-site-packages = false\n")
+    (packages / "fixture.pth").write_text(str(Path(ruamel.yaml.__file__).resolve().parents[2]) + "\n")
+    (state / "facts.json").write_text(json.dumps({"packages": {"venv": {"environment": str(environment)}}}))
+    captured = {}
+    # Use a real exited process PID, never a live gateway.
+    departed = subprocess.Popen([sys.executable, "-c", "pass"])
+    departed.wait(timeout=20)
+    stub = f"from pathlib import Path; Path({str(marker)!r}).write_text('ok')"
+    with monkeypatch.context() as patch:
+        def capture(argv, **kwargs):
+            captured.update(argv=argv, kwargs=kwargs)
+            return object()
+        patch.setattr(gateway.subprocess, "Popen", capture)
+        assert gateway._spawn_gateway_restart_watcher(
+            departed.pid, [sys.executable, "-c", stub], host=False,
+        )
+    clean_env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"}}
+    result = subprocess.run(
+        captured["argv"], cwd=tmp_path, env=clean_env,
+        capture_output=True, text=True, timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.read_text() == "ok"
 
 class TestWatcherRespawnTemplate:
 

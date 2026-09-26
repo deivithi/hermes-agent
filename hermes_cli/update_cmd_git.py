@@ -120,7 +120,10 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     return f" [{label}]" if label else ""
 
 
-def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> tuple[bool, str]:
+def _assess_parked_branch_switch(
+    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str,
+    *, assess_patch_equivalence: bool = True,
+) -> tuple[bool, str]:
     """Decide whether a parked feature branch may be auto-switched back to the update target.
 
     - (True, "") — tree clean and every parked commit is in ``origin/<target>`` (no ``git cherry +``).
@@ -129,6 +132,8 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
       /update, cron) can't resolve a skip, so a clean checkout must reach target.
     - (False, "disabled"|"dirty"|"unverifiable") — caller must NOT touch the branch. Dirty is the
       genuinely unsafe case: uncommitted work riding an autostash across branches.
+    ``assess_patch_equivalence=False`` checks only whether the tree may be updated:
+    the caller has already chosen an in-place merge, so no switch/count is needed.
     A config read failure must not disable the safety checks: fall through with the default."""
     from hermes_cli.update_cmd_git import _git_run
     try:
@@ -143,6 +148,8 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
         return False, "unverifiable"
     if status.stdout.strip():
         return False, "dirty"
+    if not assess_patch_equivalence:
+        return True, ""
     cherry = _git_run(git_cmd, ["cherry", f"origin/{target_branch}"], cwd)
     if cherry.returncode != 0:
         return False, "unverifiable"

@@ -80,10 +80,13 @@ def repo_pair(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_config(monkeypatch):
+def _no_config(monkeypatch, tmp_path):
     """Isolate the guard from the machine's real config.yaml."""
     import hermes_cli.config as hermes_config
 
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(hermes_config, "load_config", lambda: {})
 
 
@@ -312,6 +315,15 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     advance (origin/main's files arrive) AND the local commits must survive,
     with the checkout never moving."""
     import hermes_cli.config as hermes_config
+    import hermes_cli.update_cmd_git as git_helpers
+
+    original_git_run = git_helpers._git_run
+
+    def no_patch_hydration(git_cmd, args, *a, **kw):
+        assert args[0] != "cherry", "in-place updates must not hydrate patch-equivalence objects"
+        return original_git_run(git_cmd, args, *a, **kw)
+
+    monkeypatch.setattr(git_helpers, "_git_run", no_patch_hydration)
 
     monkeypatch.setattr(
         hermes_config,
@@ -350,6 +362,41 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     # ...and the branch's own commit survived it.
     assert (repo_pair / "feature.txt").read_text() == "unmerged work\n"
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
+
+
+@pytest.mark.parametrize("guard", ["clean", "dirty", "disabled", "missing_ref"])
+def test_in_place_strategy_keeps_safety_guards_without_patch_hydration(repo_pair, monkeypatch, guard):
+    import hermes_cli.config as hermes_config
+    import hermes_cli.update_cmd_git as git_helpers
+
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {"updates": {
+        "parked_branch_strategy": "update_in_place",
+        "auto_switch_parked_branch": guard != "disabled",
+    }})
+    _patch_update_flow(monkeypatch, repo_pair)
+    if guard == "dirty":
+        (repo_pair / "a.txt").write_text("uncommitted\n")
+    original_git_run = git_helpers._git_run
+
+    def without_cherry(git_cmd, args, *a, **kw):
+        assert args[0] != "cherry"
+        return original_git_run(git_cmd, args, *a, **kw)
+
+    monkeypatch.setattr(git_helpers, "_git_run", without_cherry)
+    target = "missing" if guard == "missing_ref" else "main"
+    if guard == "clean":
+        # Even a fully merged branch honors the explicit strategy; no invented
+        # unmerged count is needed, and the branch does not silently switch.
+        assert update_cmd._apply_parked_branch_guard(
+            GIT, target, "old-feature", switch_branch=False, _windows_gateway_resume=None
+        ) == (False, True, "")
+    else:
+        with pytest.raises(SystemExit) as exc:
+            update_cmd._apply_parked_branch_guard(
+                GIT, target, "old-feature", switch_branch=False, _windows_gateway_resume=None
+            )
+        assert exc.value.code == 1
+    assert _git(repo_pair, "branch", "--show-current").stdout.strip() == "old-feature"
 
 
 def test_switch_branch_flag_overrides_in_place_strategy(
