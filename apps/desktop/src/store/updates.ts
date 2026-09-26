@@ -5,7 +5,7 @@
 
 import { atom } from 'nanostores'
 
-import { connectionScoped, profileScoped } from '@/api/client'
+import { $apiRequestScope, connectionScoped, profileScoped } from '@/api/client'
 import type {
   DesktopUpdateApplyOptions,
   DesktopUpdateApplyResult,
@@ -455,8 +455,20 @@ export function requestActiveUpdate(): void {
   openUpdateOverlayFor(target)
 }
 
+let versionRetryTimer: ReturnType<typeof setTimeout> | null = null
+let versionRefreshGeneration = 0
+
 /** Refresh the active gateway version and the desktop's build metadata. */
-export async function refreshDesktopVersion(): Promise<DesktopVersionInfo | null> {
+export function refreshDesktopVersion(): Promise<DesktopVersionInfo | null> {
+  if (versionRetryTimer !== null) {
+    clearTimeout(versionRetryTimer)
+    versionRetryTimer = null
+  }
+
+  return refreshDesktopVersionAttempt(0, ++versionRefreshGeneration)
+}
+
+async function refreshDesktopVersionAttempt(attempt: number, generation: number): Promise<DesktopVersionInfo | null> {
   if (typeof window === 'undefined') {
     return null
   }
@@ -468,14 +480,30 @@ export async function refreshDesktopVersion(): Promise<DesktopVersionInfo | null
   // as an unhandled promise rejection in the renderer. Swallow it.
   try {
     const connection = $connection.get()
-    const next = await window.hermesDesktop?.getVersion?.({ ...connectionScoped(), ...profileScoped() })
+    const scope = { ...connectionScoped(), ...profileScoped() }
+    const scopeIsCurrent = () =>
+      $connection.get() === connection &&
+      connectionScoped().connectionId === scope.connectionId &&
+      profileScoped().profile === scope.profile
+    const next = await window.hermesDesktop?.getVersion?.(scope)
 
-    if ($connection.get() !== connection) {
+    if (!scopeIsCurrent() || generation !== versionRefreshGeneration) {
       return null
     }
 
     if (next) {
       $desktopVersion.set(next)
+    }
+
+    // The first version probe can time out while the backend is starting.
+    // Recover without waiting for window focus or the daily update check.
+    if (next && !next.appVersion && attempt < 6 && generation === versionRefreshGeneration) {
+      versionRetryTimer = setTimeout(() => {
+        versionRetryTimer = null
+        if (scopeIsCurrent() && generation === versionRefreshGeneration) {
+          void refreshDesktopVersionAttempt(attempt + 1, generation)
+        }
+      }, 5000)
     }
 
     return next ?? null
@@ -1160,6 +1188,7 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
 let pollerStarted = false
 let backgroundTimer: ReturnType<typeof setInterval> | null = null
 let connectionUnsub: (() => void) | null = null
+let versionScopeUnsub: (() => void) | null = null
 let lastConnectionKey: string | undefined
 
 // mode alone can't tell two remote backends apart — switching directly from
@@ -1204,14 +1233,17 @@ export function startUpdatePoller(): void {
 
   pollerStarted = true
   runPassiveChecks()
-  void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
+  versionScopeUnsub = $apiRequestScope.listen(() => void refreshDesktopVersion())
 
   // The poller starts at mount, before the gateway connects — so the first
   // backend check above sees mode≠remote and no-ops. Re-check once the
   // connection resolves to remote, and again whenever the remote target
   // itself changes (switching between two remote profiles).
   connectionUnsub = $connection.subscribe((conn: HermesConnection | null): void => {
+    // A cold boot replaces the initial connection while a version retry is
+    // pending. Start a fresh bounded sequence for the newly active gateway.
+    void refreshDesktopVersion()
     const key = connectionKey(conn)
 
     if (key === lastConnectionKey) {
@@ -1230,6 +1262,12 @@ export function startUpdatePoller(): void {
 }
 
 export function stopUpdatePoller(): void {
+  versionRefreshGeneration++
+  if (versionRetryTimer !== null) {
+    clearTimeout(versionRetryTimer)
+    versionRetryTimer = null
+  }
+
   if (backgroundTimer !== null) {
     clearInterval(backgroundTimer)
     backgroundTimer = null
@@ -1237,6 +1275,8 @@ export function stopUpdatePoller(): void {
 
   connectionUnsub?.()
   connectionUnsub = null
+  versionScopeUnsub?.()
+  versionScopeUnsub = null
   lastConnectionKey = undefined
   window.removeEventListener('focus', onFocus)
   pollerStarted = false

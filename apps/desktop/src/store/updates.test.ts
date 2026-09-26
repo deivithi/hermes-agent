@@ -142,9 +142,63 @@ const setRemote = (on: boolean) =>
 
 describe('gateway version refresh', () => {
   afterEach(() => {
+    stopUpdatePoller()
+    vi.useRealTimers()
     setApiRequestConnection(null)
     setApiRequestProfile(null)
     $desktopVersion.set(null)
+  })
+
+  it('recovers a blank startup version without window focus', async () => {
+    vi.useFakeTimers()
+    const previous = window.hermesDesktop
+    const version = { appVersion: '', commit: 'current-build' } as DesktopVersionInfo
+    const getVersion = vi
+      .fn()
+      .mockResolvedValueOnce(version)
+      .mockResolvedValue({ ...version, appVersion: '0.21.5+2449' })
+    window.hermesDesktop = { ...previous, getVersion }
+    try {
+      await refreshDesktopVersion()
+      expect($desktopVersion.get()?.appVersion).toBe('')
+      await vi.advanceTimersByTimeAsync(5000)
+      expect($desktopVersion.get()?.appVersion).toBe('0.21.5+2449')
+      await vi.advanceTimersByTimeAsync(60000)
+      expect(getVersion).toHaveBeenCalledTimes(2)
+    } finally {
+      window.hermesDesktop = previous
+    }
+  })
+
+  it('bounds retries while the gateway remains unavailable', async () => {
+    vi.useFakeTimers()
+    const previous = window.hermesDesktop
+    const getVersion = vi.fn().mockResolvedValue({ appVersion: '' })
+    window.hermesDesktop = { ...previous, getVersion }
+    try {
+      await refreshDesktopVersion()
+      await vi.advanceTimersByTimeAsync(120000)
+      expect(getVersion).toHaveBeenCalledTimes(7)
+      expect($desktopVersion.get()?.appVersion).toBe('')
+    } finally {
+      window.hermesDesktop = previous
+    }
+  })
+
+  it.each(['profile', 'stop'])('cancels a pending retry on %s change', async reason => {
+    vi.useFakeTimers()
+    const previous = window.hermesDesktop
+    const getVersion = vi.fn().mockResolvedValue({ appVersion: '' })
+    window.hermesDesktop = { ...previous, getVersion }
+    try {
+      await refreshDesktopVersion()
+      if (reason === 'profile') setApiRequestProfile('another-profile')
+      else stopUpdatePoller()
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(getVersion).toHaveBeenCalledTimes(1)
+    } finally {
+      window.hermesDesktop = previous
+    }
   })
 
   it('requests the active gateway and does not publish a previous connection reply', async () => {
@@ -1529,6 +1583,30 @@ describe('startUpdatePoller', () => {
 
     expect(checkMock).toHaveBeenCalled()
     expect($updateStatus.get()?.behind).toBe(5)
+  })
+
+  it.each(['connection', 'profile'])('refreshes a blank boot version after %s changes without focus', async change => {
+    const getVersion = vi.fn().mockResolvedValue({ appVersion: '' })
+    window.hermesDesktop = { ...window.hermesDesktop, getVersion }
+    setConnection(null)
+    setApiRequestProfile(null)
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+    expect($desktopVersion.get()?.appVersion).toBe('')
+
+    getVersion.mockResolvedValue({ appVersion: '0.21.5+2449' })
+    if (change === 'connection') setRemote(false)
+    else setApiRequestProfile('work')
+    await vi.advanceTimersByTimeAsync(0)
+    expect($desktopVersion.get()?.appVersion).toBe('0.21.5+2449')
+    const calls = getVersion.mock.calls.length
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(getVersion).toHaveBeenCalledTimes(calls)
+    stopUpdatePoller()
+    setApiRequestProfile(null)
+    setRemote(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getVersion).toHaveBeenCalledTimes(calls)
   })
 
   it('polls once per day and never forces past the caches', async () => {
