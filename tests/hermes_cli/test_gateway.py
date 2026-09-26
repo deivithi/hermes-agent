@@ -15,6 +15,64 @@ import hermes_cli.gateway as gateway
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+@pytest.mark.parametrize("invalid", [None, "wrong_home", "malformed", "reused_pid"])
+def test_all_profiles_finds_verified_gateway_without_visible_cmdline(
+    tmp_path, monkeypatch, invalid
+):
+    from gateway import status
+    from hermes_cli import profiles
+    from hermes_cli._launchers import runtime_command
+
+    home = tmp_path / "profile-a"
+    home.mkdir()
+    other_home = tmp_path / "profile-b"
+    other_home.mkdir()
+    pid = os.getpid()
+    record = {
+        "pid": pid, "kind": "hermes-gateway",
+        "argv": runtime_command(tmp_path / "source", ["gateway", "run"], python="python.exe"),
+        "start_time": status._get_process_start_time(pid),
+        "hermes_home": str(home.resolve()),
+    }
+    if invalid == "wrong_home":
+        record["hermes_home"] = str(other_home.resolve())
+    elif invalid == "malformed":
+        record["argv"] = []
+        record["kind"] = "unrelated"
+    elif invalid == "reused_pid":
+        record["start_time"] += 1
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(status, "_build_pid_record", lambda: record)
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
+    monkeypatch.setattr(profiles, "list_profiles", lambda: [
+        SimpleNamespace(name="a", path=home), SimpleNamespace(name="b", path=other_home)
+    ])
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: [])
+    monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    assert status.acquire_gateway_runtime_lock()
+    try:
+        status.write_pid_file()
+        before = (home / "gateway.pid").read_bytes()
+        assert gateway.find_gateway_pids(all_profiles=True) == []  # never include the caller
+        # Model an updater caller distinct from the live identity owner.
+        monkeypatch.setattr(gateway, "os", SimpleNamespace(getpid=lambda: pid + 1))
+        expected = [] if invalid else [pid]
+        # Switching the caller's active profile must not affect fleet discovery.
+        for active_home in (home, other_home, home):
+            monkeypatch.setenv("HERMES_HOME", str(active_home))
+            assert gateway.find_gateway_pids(all_profiles=True) == expected
+        assert gateway.find_gateway_pids(exclude_pids={pid}, all_profiles=True) == []
+        assert (home / "gateway.pid").read_bytes() == before
+        assert (home / "gateway.lock").exists()
+        if not invalid:
+            monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: [pid])
+            monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *args, **kwargs: [pid])
+            assert gateway.find_gateway_pids(all_profiles=True) == [pid]
+    finally:
+        status.release_gateway_runtime_lock()
+
+
 @pytest.fixture(autouse=True)
 def inert_task_scheduler_probe():
     """Tests that fake ``is_windows()`` send the reaper through ``_windows_scheduled_task_state``,

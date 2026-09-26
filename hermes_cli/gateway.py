@@ -737,7 +737,12 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
     """Find running gateway PIDs for the current profile, or every profile with ``all_profiles`` (``hermes update``)."""
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
-    if not all_profiles:
+    if all_profiles:
+        # Session 0 processes may hide their command line from an interactive
+        # updater. Use the same live lock/identity validation as profile status.
+        for process in find_profile_gateway_processes(exclude_pids=_exclude):
+            _append_unique_pid(pids, process.pid, _exclude)
+    else:
         try:
             from gateway.status import get_running_pid
             _append_unique_pid(pids, get_running_pid(), _exclude)
