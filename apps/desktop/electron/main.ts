@@ -3529,7 +3529,7 @@ function resolveCheckoutUpdateStrategy(): UpdaterStrategy {
         return
       }
 
-      preflightStateDb({
+      await preflightStateDb({
         python: await findPythonForRoot(root),
         script: path.join(root, 'hermes_cli', 'backup_sqlite.py'),
         home,

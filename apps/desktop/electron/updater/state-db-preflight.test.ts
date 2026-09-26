@@ -45,7 +45,7 @@ c.close()
 
   try {
     await once(child.stdout!, 'data')
-    preflightStateDb({
+    await preflightStateDb({
       python,
       script,
       home,
@@ -87,13 +87,13 @@ with sqlite3.connect(sys.argv[1]) as c:
   }
 })
 
-test('an older selected checkout without the snapshot helper refuses before backend stop', (): void => {
+test('an older selected checkout without the snapshot helper refuses before backend stop', async (): Promise<void> => {
   const oldRoot: string = fs.mkdtempSync(path.join(os.tmpdir(), 'old-preflight-'))
   let stopped = false
 
   try {
-    assert.throws((): void => {
-      preflightStateDb({
+    await assert.rejects(async (): Promise<void> => {
+      await preflightStateDb({
         python: process.env.HERMES_PYTHON || 'python3',
         script: path.join(oldRoot, 'hermes_cli', 'backup_sqlite.py'),
         home: oldRoot,
@@ -104,5 +104,50 @@ test('an older selected checkout without the snapshot helper refuses before back
     assert.equal(stopped, false)
   } finally {
     fs.rmSync(oldRoot, { recursive: true, force: true })
+  }
+})
+
+test('a slow snapshot leaves the main event loop responsive and shutdown waits', async (): Promise<void> => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'slow-preflight-'))
+  const script = path.join(home, 'snapshot.py')
+  fs.writeFileSync(script, 'import time\ntime.sleep(0.4)\nprint("snapshot complete")\n')
+  let stopped = false
+  try {
+    const pending = preflightStateDb({
+      python: process.env.HERMES_PYTHON || 'python3',
+      script,
+      home,
+      log: (): void => {}
+    }).then(() => {
+      stopped = true
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(stopped, false)
+    await pending
+    assert.equal(stopped, true)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a snapshot that exceeds its deadline fails closed before backend shutdown', async (): Promise<void> => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'timeout-preflight-'))
+  const script = path.join(home, 'snapshot.py')
+  fs.writeFileSync(script, 'import time\ntime.sleep(30)\n')
+  let stopped = false
+  try {
+    await assert.rejects(async () => {
+      await preflightStateDb({
+        python: process.env.HERMES_PYTHON || 'python3',
+        script,
+        home,
+        timeoutMs: 100,
+        log: (): void => {}
+      })
+      stopped = true
+    }, /exceeded.*Update cancelled before backend shutdown/)
+    assert.equal(stopped, false)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
   }
 })

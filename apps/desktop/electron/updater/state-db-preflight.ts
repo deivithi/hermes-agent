@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 
 import { hiddenWindowsChildOptions } from '../windows-child-options'
 
@@ -7,20 +7,43 @@ interface StateDbPreflight {
   script: string
   home: string
   log: (message: string) => void
+  timeoutMs?: number
 }
 
-// Synchronous by design: the caller must not stop the backend before the snapshot.
-export function preflightStateDb({ python, script, home, log }: StateDbPreflight): void {
+export const STATE_DB_PREFLIGHT_TIMEOUT_MS = 10 * 60_000
+
+// Await the snapshot before shutdown, without blocking Electron's main loop.
+export async function preflightStateDb({
+  python,
+  script,
+  home,
+  log,
+  timeoutMs = STATE_DB_PREFLIGHT_TIMEOUT_MS
+}: StateDbPreflight): Promise<void> {
   try {
     if (!python) {
       throw new Error('Python not found')
     }
 
-    const result: string = execFileSync(
-      python,
-      ['-I', '-S', script, home],
-      hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] })
-    )
+    log(`[updates] state.db pre-flight: snapshot and integrity check started (limit ${timeoutMs / 1000}s)`)
+    const result = await new Promise<string>((resolve, reject) => {
+      execFile(
+        python,
+        ['-I', '-S', script, home],
+        hiddenWindowsChildOptions({ encoding: 'utf8', timeout: timeoutMs }),
+        (error, stdout) => {
+          if (error) {
+            reject(
+              error.killed
+                ? new Error(`Snapshot and integrity check exceeded ${timeoutMs / 1000} seconds`, { cause: error })
+                : error
+            )
+          } else {
+            resolve(stdout)
+          }
+        }
+      )
+    })
 
     log(`[updates] state.db pre-flight: ${result.trim()}`)
   } catch (error: unknown) {
