@@ -2,6 +2,7 @@
 home/profile) that tell whether the gateway daemon is running."""
 
 import asyncio
+import ast
 import contextlib
 import copy
 import hashlib
@@ -588,6 +589,74 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
+def _native_launcher_gateway_command(command: str) -> str | None:
+    """Unwrap only PM's exact in-process CLI bootstrap, never arbitrary ``-c``.
+
+    The native launcher runs the CLI through runpy in THIS process. Restart
+    watchers also use -c, but merely carry a future gateway's argv as data.
+    Compare the entire source AST to the launcher's own generator so neither
+    a quoted example nor extra executable statements can claim that identity.
+    """
+    if not re.search(r"\s+-I\s+-c\s+", command):
+        return None
+    argv = None
+    if _IS_WINDOWS:
+        # Decode CRT quoting before parsing Python: repr() uses double quotes
+        # for O'Neil paths, escaped by list2cmdline. shlex is not a CRT decoder.
+        import ctypes
+        from ctypes import wintypes
+
+        shell = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        shell.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        shell.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        count = ctypes.c_int()
+        parsed = shell.CommandLineToArgvW(command, ctypes.byref(count))
+        if parsed:
+            try:
+                values = list(parsed[:count.value])
+                if len(values) >= 5 and values[1:3] == ["-I", "-c"] and values[3].startswith("import os,"):
+                    argv = values
+            finally:
+                kernel.LocalFree(parsed)
+    if argv is not None:
+        executable, source, trailing = argv[0], argv[3], subprocess.list2cmdline(argv[4:])
+    else:
+        # psutil's caller also supplies an unquoted " ".join(argv). Recover
+        # that known layout without treating arbitrary inline code as identity.
+        match = re.fullmatch(
+            r'(.+?)\s+-I\s+-c\s+(.*?)'
+            r"(runpy\.run_module\('hermes_cli\.main', run_name='__main__', alter_sys=True\))"
+            r'"?\s+(.*)', command, re.DOTALL,
+        )
+        if match is None:
+            return None
+        executable, source, trailing = match[1], match[2] + match[3], match[4]
+        if source.startswith('"'):
+            source = source[1:]
+    interpreter = executable.strip('"').replace('\\', '/').rsplit('/', 1)[-1]
+    if not re.fullmatch(r'pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?', interpreter, re.IGNORECASE):
+        return None
+    try:
+        tree = ast.parse(source)
+        # These positions belong to the fixed bootstrap, not arbitrary user code.
+        root = tree.body[4].value.args[1].value
+        home_expr = tree.body[5].value.values[1]
+        home = home_expr.value if isinstance(home_expr, ast.Constant) else None
+        if not isinstance(root, str) or (home is not None and not isinstance(home, str)):
+            return None
+        from hermes_cli._launchers import runtime_command
+
+        expected = runtime_command(Path(root), python="python", home=home)[3]
+        if ast.dump(tree) != ast.dump(ast.parse(expected)):
+            return None
+    except (SyntaxError, ValueError, TypeError, AttributeError, IndexError, OSError):
+        return None
+    return f"hermes -m hermes_cli.main {trailing}"
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -596,6 +665,9 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     argv since ``_apply_profile_override`` removes them before argparse."""
     if not command:
         return None
+    native_command = _native_launcher_gateway_command(command)
+    if native_command is not None:
+        command = native_command
     try:
         raw_tokens = shlex.split(command, posix=False)
     except ValueError:

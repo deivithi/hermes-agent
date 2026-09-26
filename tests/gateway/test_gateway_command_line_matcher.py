@@ -9,6 +9,9 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+import os
+import subprocess
+
 import pytest
 
 from gateway.status import (
@@ -16,6 +19,87 @@ from gateway.status import (
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
 )
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("args,expected", [
+    (["gateway", "run"], True),
+    (["gateway", "restart"], True),
+    (["--profile", "work", "gateway", "run"], True),
+    (["gateway", "status"], False),
+    (["serve"], False),
+])
+def test_native_pm_bootstrap_is_the_running_cli(tmp_path, quoted, args, expected):
+    from hermes_cli._launchers import runtime_command
+
+    command = runtime_command(tmp_path / "install with spaces", args, python="python.exe")
+    text = subprocess.list2cmdline(command) if quoted else " ".join(command)
+    assert matches_runtime(text) is expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CommandLineToArgvW quoting contract")
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("suffix", ["O'Neil", "home with spaces", "O'Neil\\"])
+def test_native_pm_bootstrap_preserves_windows_path_quotes(tmp_path, quoted, suffix):
+    from hermes_cli._launchers import runtime_command
+
+    command = runtime_command(
+        tmp_path / "O'Neil" / "source tree", ["gateway", "run"],
+        python=str(tmp_path / "Python tools" / "python.exe"), home=str(tmp_path / suffix),
+    )
+    text = subprocess.list2cmdline(command) if quoted else " ".join(command)
+    assert matches_runtime(text)
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("mutation", [
+    "prepend", "append", "exec", "wrong_module", "watcher", "other_interpreter",
+])
+def test_native_pm_recognition_rejects_inline_impostors(tmp_path, mutation, quoted):
+    from hermes_cli._launchers import runtime_command
+
+    command = runtime_command(tmp_path, ["gateway", "run"], python="python.exe")
+    if mutation == "prepend":
+        command[3] = "print('not a launcher'); " + command[3]
+    elif mutation == "append":
+        command[3] += "; print('not a launcher')"
+    elif mutation == "exec":
+        command = runtime_command(tmp_path, ["gateway", "run"], python="python.exe", code="print('gateway')")
+    elif mutation == "wrong_module":
+        command = runtime_command(tmp_path, ["gateway", "run"], python="python.exe", module="not_hermes")
+    elif mutation == "watcher":
+        command[3] = "print(" + repr(command[3]) + ")"
+    else:
+        command[0] = "not-python.exe"
+    text = subprocess.list2cmdline(command) if quoted else " ".join(command)
+    assert not matches_runtime(text)
+
+
+def test_native_pm_identity_keeps_live_pid_metadata(tmp_path, monkeypatch):
+    from gateway import status
+    from hermes_cli._launchers import runtime_command
+
+    command = runtime_command(tmp_path / "source tree", ["gateway", "run"], python="python.exe")
+    record = {
+        "pid": os.getpid(), "kind": "hermes-gateway", "argv": command,
+        "start_time": status._get_process_start_time(os.getpid()),
+        "hermes_home": str(tmp_path.resolve()),
+    }
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(status, "_build_pid_record", lambda: record)
+    monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: " ".join(command))
+    assert status.acquire_gateway_runtime_lock()
+    try:
+        status.write_pid_file()
+        # This unscoped reader used to unlink a LIVE gateway's PID metadata,
+        # causing the next strict update inventory to refuse the installation.
+        assert status.get_running_pid() == os.getpid()
+        assert (tmp_path / "gateway.pid").exists()
+        assert (tmp_path / "gateway.lock").exists()
+        identity = status.get_running_pid_identity_strict(tmp_path / "gateway.pid")
+        assert identity is not None and identity[0] == os.getpid()
+    finally:
+        status.release_gateway_runtime_lock()
 
 
 ACCEPT = [
@@ -163,5 +247,3 @@ ATOMIC_DESKTOP = (
 def test_accepts_atomic_desktop_gateway():
     assert matches(ATOMIC_DESKTOP) is True
     assert matches_runtime(ATOMIC_DESKTOP) is True
-
-
