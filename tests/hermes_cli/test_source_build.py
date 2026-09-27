@@ -27,12 +27,12 @@ def copy_freshness_scripts(root):
         shutil.copy2(repository / "scripts/build" / name, scripts / name)
 
 
-def stamp_product(root, product, out):
+def stamp_product(root, product, out, prepared=None):
     script = (root / "scripts/build/freshness.mjs").as_uri()
     subprocess.run([shutil.which("node"), "--input-type=module", "-e",
                     f"import {{recordProduct, buildInputs}} from {json.dumps(script)};"
                     "const [source, product, out] = process.argv.slice(1);"
-                    "recordProduct({source, product, out, inputs: buildInputs(source, product)});",
+                    f"recordProduct({{source, product, out, inputs: buildInputs(source, product, {json.dumps(prepared or {})})}});",
                     str(root), product, str(out)], check=True)
 
 
@@ -57,9 +57,11 @@ def test_source_build_uses_selected_python_for_isolated_icon_child(tmp_path, mon
                     "import icon_dependency; assert icon_dependency.ready"], check=True)
 
 
-def test_automatic_build_preserves_pm_admission_intent(monkeypatch):
+def test_automatic_build_preserves_pm_admission_intent(tmp_path, monkeypatch):
     from hermes_cli.source_build import source_build_env
+    from pm import paths
 
+    monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)
     intent = []
     def acquire(name, *, base_env, explicit):
         intent.append(explicit)
@@ -108,8 +110,14 @@ def source_checkout(tmp_path, monkeypatch):
             [str(Path(npm).parent), str(Path(node).parent), os.environ["PATH"]])})
 
     monkeypatch.setattr(pm, "ensure", acquire)
+    # Freshness is a read-only tool lookup; use the same host Node as the
+    # fixture compilers without consulting the operator's PM manifest.
+    monkeypatch.setattr(pm, "env_for", lambda *names: {**os.environ, "PATH": os.pathsep.join(
+        [str(Path(node).parent), os.environ["PATH"]])})
     root = tmp_path / "source with spaces"
     root.mkdir()
+    from pm import paths
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
     workspaces = ["ui-tui", "web", "apps/desktop", "unrelated"]
     manifest = {"name": "build-fixture", "private": True, "version": "1.0.0",
                 "workspaces": workspaces, "scripts": {"postinstall": "node log.mjs deps"}}
@@ -299,3 +307,197 @@ def test_module_cli_builds_the_requested_products(source_products, desktop, monk
     assert acquired == ["npm"]
     assert (root / "hermes_cli/web_dist/index.html").is_file()
     assert (root / "apps/desktop/release/linux-unpacked/hermes").exists() == desktop
+
+
+def test_update_reuses_valid_frontends_without_rewriting_receipts(source_products, monkeypatch):
+    from hermes_cli.source_build import build_update_products
+    from hermes_cli import memory_provider_migration
+
+    root, _ = source_products
+    migrations = []
+    monkeypatch.setattr(memory_provider_migration, "migrate_all_homes", lambda: migrations.append(True))
+    build_update_products(root, desktop=False)
+    receipts = [root / "ui-tui/dist/hermes-build.json", root / "hermes_cli/web_dist/hermes-build.json"]
+    before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in receipts]
+    events = _events(root)
+    build_update_products(root, desktop=False)
+    assert _events(root) == events
+    assert [(path.read_bytes(), path.stat().st_mtime_ns) for path in receipts] == before
+    assert migrations == [True, True]
+
+
+@pytest.mark.parametrize("product", ["tui", "web"])
+@pytest.mark.parametrize("invalid", ["source", "dependencies", "output", "receipt"])
+def test_update_rebuilds_invalid_frontend_receipts(source_products, product, invalid):
+    from hermes_cli.source_build import build_update_products, source_product_current
+
+    root, _ = source_products
+    build_update_products(root, desktop=False)
+    workspace = root / ("ui-tui" if product == "tui" else "web")
+    out = root / ("ui-tui/dist" if product == "tui" else "hermes_cli/web_dist")
+    if invalid == "dependencies":
+        prepared = root / "node_modules/prepared-fixture.txt"
+        prepared.write_text("original dependency", encoding="utf-8")
+        stamp_product(root, product, out, {"dependency": str(prepared)})
+    assert source_product_current(root, product, out)
+    if invalid == "source":
+        (workspace / "src").mkdir()
+        (workspace / "src/entry.ts").write_text("changed source", encoding="utf-8")
+    elif invalid == "dependencies":
+        prepared.write_text("changed dependency", encoding="utf-8")
+    elif invalid == "output":
+        (out / ("entry.js" if product == "tui" else "index.html")).write_text("corrupted", encoding="utf-8")
+    else:
+        (out / "hermes-build.json").unlink()
+    assert not source_product_current(root, product, out)
+    before = len(_events(root))
+    build_update_products(root, desktop=False)
+    assert [event["step"] for event in _events(root)[before:]] == [product]
+    assert source_product_current(root, product, out)
+
+
+@pytest.mark.parametrize("failure", ["unavailable-node", "failed-check"])
+def test_update_rebuilds_when_freshness_cannot_be_verified(source_products, monkeypatch, failure):
+    from hermes_cli.source_build import build_update_products
+
+    root, _ = source_products
+    build_update_products(root, desktop=False)
+    if failure == "unavailable-node":
+        monkeypatch.setattr(pm, "env_for", lambda *names: {"PATH": ""})
+    else:
+        (root / "scripts/build/freshness.mjs").write_text("throw new Error('receipt unreadable');", encoding="utf-8")
+        # The fixture compilers import freshness too. Restore only their recipes
+        # so verification fails while rebuild still runs as a real subprocess.
+        for product in ("tui", "web"):
+            (root / f"scripts/build/{product}.mjs").write_text(
+                "import { appendFileSync } from 'node:fs';"
+                f"appendFileSync('events.jsonl', JSON.stringify({{step: {product!r}}}) + '\\n');",
+                encoding="utf-8",
+            )
+    before = len(_events(root))
+    build_update_products(root, desktop=False)
+    assert [event["step"] for event in _events(root)[before:]] == ["tui", "web"]
+
+
+@pytest.mark.parametrize("product", ["tui", "web"])
+def test_invalid_cached_frontend_build_failure_aborts_update(source_products, product):
+    from hermes_cli.source_build import build_update_products
+
+    root, _ = source_products
+    build_update_products(root, desktop=False)
+    out = root / ("ui-tui/dist" if product == "tui" else "hermes_cli/web_dist")
+    artifact = out / ("entry.js" if product == "tui" else "index.html")
+    before = artifact.read_bytes()
+    (out / "hermes-build.json").unlink()
+    (root / f"fail-{product}").touch()
+    events_before = len(_events(root))
+    with pytest.raises(subprocess.CalledProcessError):
+        build_update_products(root, desktop=False)
+    assert [event["step"] for event in _events(root)[events_before:]] == [product]
+    assert artifact.read_bytes() == before
+    assert not (out / "hermes-build.json").exists()
+
+
+@pytest.fixture
+def cached_desktop(source_products, monkeypatch):
+    from hermes_cli import main_desktop
+    from hermes_cli.source_build import build_update_products
+
+    root, _ = source_products
+    build_update_products(root, desktop=False)
+    directory, executable = ("win-unpacked", "Hermes.exe") if sys.platform == "win32" else ("linux-unpacked", "hermes")
+    if sys.platform == "darwin":
+        app = root / "apps/desktop/release/mac/Hermes.app/Contents/MacOS/Hermes"
+        out = app.parent.parent / "Resources/app.asar.unpacked/dist"
+    else:
+        app = root / "apps/desktop/release" / directory / executable
+        out = app.parent / "resources/app.asar.unpacked/dist"
+    app.parent.mkdir(parents=True, exist_ok=True)
+    app.write_text("current app", encoding="utf-8")
+    out.mkdir(parents=True)
+    (out / "index.html").write_text('<script type="module" src="./assets/main.js"></script>', encoding="utf-8")
+    (out / "assets").mkdir()
+    (out / "assets/main.js").write_text("renderer", encoding="utf-8")
+    builds, installed = [], []
+
+    def build(desktop_dir, **kwargs):
+        assert desktop_dir == root / "apps/desktop" and kwargs["source_mode"] is False
+        builds.append(True)
+        (out / "assets/main.js").write_text("renderer", encoding="utf-8")
+        stamp_product(root, "desktop", out)
+
+    def install(desktop_dir):
+        assert desktop_dir == root / "apps/desktop"
+        destination = root.parent / "installed-app"
+        destination.write_text(app.read_text(), encoding="utf-8")
+        installed.append(destination)
+        return [destination], []
+
+    monkeypatch.setattr(main_desktop, "build_prepared_desktop", build)
+    monkeypatch.setattr(main_desktop, "_install_rebuilt_desktop_app", install)
+    # Prepare the same union the updater will use before writing the receipt.
+    from hermes_cli.source_build import prepare_source_dependencies, source_build_env
+    prepare_source_dependencies(root, ("ui-tui", "web", "apps/desktop"), env=source_build_env(), explicit=True)
+    stamp_product(root, "desktop", out)
+    return root, out, builds, installed
+
+
+def test_update_reuses_desktop_but_heals_installed_copy(cached_desktop):
+    from hermes_cli.source_build import build_update_products
+
+    root, out, builds, installed = cached_desktop
+    receipt = out / "hermes-build.json"
+    before = receipt.read_bytes(), receipt.stat().st_mtime_ns
+    build_update_products(root, desktop=True)
+    build_update_products(root, desktop=True)
+    assert builds == []
+    assert len(installed) == 2
+    assert installed[0].read_text() == "current app"
+    assert (receipt.read_bytes(), receipt.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("invalid", ["source", "dependencies", "output", "receipt", "torn-renderer", "missing-native"])
+def test_update_rebuilds_invalid_desktop_before_installing(cached_desktop, invalid):
+    from hermes_cli.source_build import build_update_products
+
+    root, out, builds, installed = cached_desktop
+    if invalid == "source":
+        (root / "apps/desktop/src").mkdir()
+        (root / "apps/desktop/src/main.ts").write_text("changed", encoding="utf-8")
+    elif invalid == "dependencies":
+        prepared = root / "node_modules/desktop-prepared.txt"
+        prepared.write_text("original", encoding="utf-8")
+        stamp_product(root, "desktop", out, {"native": str(prepared)})
+        prepared.write_text("changed", encoding="utf-8")
+    elif invalid == "output":
+        (out / "assets/main.js").write_text("corrupted", encoding="utf-8")
+    elif invalid == "receipt":
+        (out / "hermes-build.json").unlink()
+    elif invalid == "torn-renderer":
+        (out / "assets/main.js").unlink()
+        # An apparently matching receipt does not override the bundle gate.
+        stamp_product(root, "desktop", out)
+    else:
+        native = out / "node_modules/node-pty"
+        native.mkdir(parents=True)
+        (native / "package.json").write_text('{}', encoding="utf-8")
+        stamp_product(root, "desktop", out)
+    build_update_products(root, desktop=True)
+    assert builds == [True]
+    assert len(installed) == 1
+
+
+def test_cached_desktop_rebuild_failure_aborts_install(cached_desktop, monkeypatch):
+    from hermes_cli.source_build import build_update_products
+    from hermes_cli import main_desktop
+
+    root, out, _, installed = cached_desktop
+    (out / "hermes-build.json").unlink()
+
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "desktop-builder")
+
+    monkeypatch.setattr(main_desktop, "build_prepared_desktop", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        build_update_products(root, desktop=True)
+    assert installed == []

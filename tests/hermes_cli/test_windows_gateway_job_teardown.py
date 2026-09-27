@@ -28,7 +28,16 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 import hermes_cli.gateway as gateway
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_store(tmp_path, monkeypatch):
+    # Resolve the real launcher against an empty test-owned store, never the
+    # installed manifest. The real bootstrap and subprocess still execute.
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
 
 # ---------------------------------------------------------------------------
 # 1. Watcher template contract

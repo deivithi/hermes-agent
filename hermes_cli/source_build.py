@@ -115,19 +115,31 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
     publish_stage("Updating Node dependencies")
     prepare_source_dependencies(project_root, workspaces, env=env, explicit=True)
     if "ui-tui" in frontends:
-        publish_stage("Building the TUI")
-        build_source_tui(project_root, env=env)
+        if source_product_current(project_root, "tui", project_root / "ui-tui/dist"):
+            publish_stage("Reusing the current TUI build")
+        else:
+            publish_stage("Building the TUI")
+            build_source_tui(project_root, env=env)
     if "web" in frontends:
-        publish_stage("Building the web UI")
-        build_source_web(project_root, env=env)
+        if source_product_current(project_root, "web", project_root / "hermes_cli/web_dist"):
+            publish_stage("Reusing the current web UI build")
+        else:
+            publish_stage("Building the web UI")
+            build_source_web(project_root, env=env)
     if desktop:
-        from hermes_cli.main_desktop import _install_rebuilt_desktop_app, build_prepared_desktop
-
-        publish_stage("Building the desktop app")
-        build_prepared_desktop(
-            project_root / "apps/desktop", source_mode=False,
-            npm=shutil.which("npm", path=env["PATH"]), env=env, icons=project_root,
+        from hermes_cli.main_desktop import (
+            _desktop_build_needed, _install_rebuilt_desktop_app, build_prepared_desktop,
         )
+
+        desktop_dir = project_root / "apps/desktop"
+        if _desktop_build_needed(desktop_dir, project_root, source_mode=False):
+            publish_stage("Building the desktop app")
+            build_prepared_desktop(
+                desktop_dir, source_mode=False,
+                npm=shutil.which("npm", path=env["PATH"]), env=env, icons=project_root,
+            )
+        else:
+            publish_stage("Reusing the current desktop app build")
         # A current release/ can still sit beside a stale installed copy (an earlier
         # update rebuilt but never installed); healing must not wait for the next build.
         installed, problems = _install_rebuilt_desktop_app(project_root / "apps/desktop")
