@@ -3,24 +3,35 @@ import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_BACKEND_READY_TIMEOUT_MS } from '../../electron/backend-health'
 import { DEFAULT_PROBE_TIMEOUT_MS } from '../../electron/backend-probes'
 import { DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS } from '../../electron/backend-ready'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, TimeoutError, withTimeout } from './with-timeout'
+import { BACKEND_BOOT_WAIT_TIMEOUT_MS } from './backend-boot-budget'
+import {
+  BACKEND_BOOT_WAIT_TIMEOUT_MS as OFFICIAL_READINESS_TIMEOUT_MS,
+  TimeoutError,
+  withTimeout
+} from './with-timeout'
 
 describe('withTimeout', () => {
   it('allows the main-process default probe, announcement and readiness phases to finish', () => {
+    expect(OFFICIAL_READINESS_TIMEOUT_MS).toBe(DEFAULT_BACKEND_READY_TIMEOUT_MS)
+    expect(BACKEND_BOOT_WAIT_TIMEOUT_MS).toBe(
+      DEFAULT_PROBE_TIMEOUT_MS + DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS + DEFAULT_BACKEND_READY_TIMEOUT_MS + 5_000
+    )
     expect(BACKEND_BOOT_WAIT_TIMEOUT_MS).toBeGreaterThan(
       DEFAULT_PROBE_TIMEOUT_MS + DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS + DEFAULT_BACKEND_READY_TIMEOUT_MS
     )
   })
 
-  it('keeps a healthy cold boot pending past 45 seconds and accepts its late descriptor', async () => {
+  it('keeps a healthy cold boot pending past the official readiness budget and accepts its late descriptor', async () => {
     vi.useFakeTimers()
     try {
       let resolveBackend!: (value: string) => void
-      const backend = new Promise<string>(resolve => { resolveBackend = resolve })
+      const backend = new Promise<string>(resolve => {
+        resolveBackend = resolve
+      })
       const completed = vi.fn()
       const result = withTimeout(backend, BACKEND_BOOT_WAIT_TIMEOUT_MS, 'boot timed out')
       void result.then(completed)
-      await vi.advanceTimersByTimeAsync(60_000)
+      await vi.advanceTimersByTimeAsync(OFFICIAL_READINESS_TIMEOUT_MS + 20_000)
       expect(completed).not.toHaveBeenCalled()
       resolveBackend('ready')
       await expect(result).resolves.toBe('ready')

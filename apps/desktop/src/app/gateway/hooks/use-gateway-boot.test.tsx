@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopBootstrapState, DesktopConnectionsRegistry } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
+import { BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/backend-boot-budget'
 import { $desktopBoot } from '@/store/boot'
 import {
   $connectionsRegistry,
